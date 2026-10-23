@@ -1,0 +1,14 @@
+# Local run: docker compose up --build
+services:
+  api:
+    build:
+      context: .
+      args:
+        APP_VERSION: local
+    image: task-api:local
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: local
+      LOG_LEVEL: INFO
+    restart: unless-stopped

@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  task-api runtime: VPC, Application Load Balancer, ECS Fargate cluster and
+  service, CloudWatch logs.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: task-api
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}$"
+    Description: Must match AppName in 01-bootstrap.yml.
+  ImageUri:
+    Type: String
+    Description: Full image URI including tag, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/task-api:initial
+  EnvironmentName:
+    Type: String
+    Default: production
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 4
+    Description: >-
+      Keep at 1 while the app uses its in-memory store: with more tasks each
+      would hold different data. Raise it once storage moves to a database.
+  TaskCpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+  TaskMemory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM certificate ARN. When set, the ALB serves HTTPS and redirects HTTP to it.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ network
+  # Two public subnets in two AZs (the ALB requires two). Tasks get public IPs
+  # so they can pull from ECR without a NAT gateway (saves ~USD 32/month);
+  # their security group still only accepts traffic from the load balancer.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-igw" }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-public-rt" }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------- security groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP/HTTPS to the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-alb-sg" }]
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Containers accept traffic only from the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: From ALB only
+      Tags: [{ Key: Name, Value: !Sub "${AppName}-service-sg" }]
+
+  # ------------------------------------------------------------ load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-tg"
+      VpcId: !Ref Vpc
+      TargetType: ip # required for Fargate (awsvpc networking)
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        # Faster rollouts: drain old tasks for 30s instead of the default 300s.
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - HasCertificate
+        - - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: "443", StatusCode: HTTP_301 }
+        - - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------- ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}-cluster"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Used by the ECS agent to pull the image and write logs.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Used by the application code itself. Empty on purpose: the app calls no
+  # AWS APIs. Add permissions here if it later uses DynamoDB, S3, etc.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AppName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64 # matches the image GitHub's ubuntu runners build
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref AppName # the pipeline's ECS_CONTAINER_NAME must match this
+          Image: !Ref ImageUri
+          Essential: true
+          ReadonlyRootFilesystem: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - { Name: APP_NAME, Value: !Ref AppName }
+            - { Name: ENVIRONMENT, Value: !Ref EnvironmentName }
+            - { Name: LOG_LEVEL, Value: INFO }
+            - { Name: PORT, Value: !Ref ContainerPort }
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub >-
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${ContainerPort}/health', timeout=4)" || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+          StopTimeout: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub "${AppName}-service"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        # Rolling update: start the new task before stopping the old one
+        # (zero downtime), and roll back automatically if it never gets healthy.
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: !Ref AppName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  AppUrl:
+    Description: Public URL of the API. Set as the APP_URL variable in GitHub.
+    Value: !If
+      - HasCertificate
+      - !Sub "https://${LoadBalancer.DNSName}"
+      - !Sub "http://${LoadBalancer.DNSName}"
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskDefinitionFamily:
+    Value: !Ref AppName
+  LogGroupName:
+    Value: !Ref LogGroup

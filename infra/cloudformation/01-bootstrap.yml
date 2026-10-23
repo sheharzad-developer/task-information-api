@@ -90,8 +90,13 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
                 # Only jobs in this repo's chosen environment, nothing else.
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironment}
+                # Second form: repos using GitHub's immutable subject claims
+                # send "owner@<id>/repo@<id>" instead of "owner/repo".
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:${GitHubEnvironment}
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:${GitHubEnvironment}
       Policies:
         - PolicyName: ecr-push
           PolicyDocument:
